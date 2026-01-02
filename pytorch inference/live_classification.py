@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torchaudio.transforms as T
 import os
 
-import queue
+from collections import deque
 import time
 
 
@@ -36,18 +36,22 @@ print(model_path, "\n")
 # architecture
 model = AudioCNN()
 model = model.to(device)
-model.load_state_dict(torch.load(model_path)) # map_location=device?
+model.load_state_dict(torch.load(model_path)) # map_location=device?####
 model.eval()
 
 # Compile model if using PyTorch 2.0+ (significant speedup)     -- triton??
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.backends.cudnn.benchmark = True  # Find optimal algorithms
+    
+    #model = torch.compile(model, mode='reduce-overhead') # requires triton - huge speedup
 
 
 class_names = ["horn", "other", "siren"] # list(test_dataset.classes)
 
 
+# move transforms to gpu
 mel_transform = T.MelSpectrogram(
     sample_rate=SAMPLE_RATE, 
     n_fft=1024, 
@@ -57,78 +61,84 @@ mel_transform = T.MelSpectrogram(
 
 amplitude_to_db = T.AmplitudeToDB().to(device)
 
-q = queue.Queue()
-audio_buffer = np.array([], dtype=np.float32)
+audio_buffer = deque(maxlen=CHUNK_SIZE*2) # O(1)
 
+#preallocate tensors - avoid repeat allocation
+waveform_buffer = torch.zeros(CHUNK_SIZE, device=device, dtype=torch.float32)
 
 def callback(indata, frames, time_info, status):
     if status:
         print(status)
 
     # extract mono channel directly
-    q.put(indata[:,0].astype(np.float32))
+    audio_buffer.extend(indata[:,0].astype(np.float32))
 
 
 # List all available audio devices
 #print("Available audio devices:")
 #print(sd.query_devices())
 
-print("Starting Audio Stream...")
+# warm up - dummy inference to init CUDA kernels
+print("Warming up...\n")
+with torch.no_grad():
+    dummy_input = torch.randn(1,1,64,432, device=device) ## correct?
+    _ = model(dummy_input)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+print("warm up complete\n")
+
+print("\nStarting Audio Stream...")
 
 with sd.InputStream(callback=callback, channels=1, samplerate=SAMPLE_RATE, blocksize=2048):
     with torch.no_grad():
         while True:
 
-            try:
-                audio_chunk = q.get(timeout=1.0)#??
-            except queue.Empty:
+            if len(audio_buffer) < CHUNK_SIZE:
+                time.sleep(0.01)
                 continue
 
-            audio_buffer = np.concatenate([audio_buffer, audio_chunk])
+            start_time = time.perf_counter()
 
-            # keep buffer from growing too large
-            if len(audio_buffer) > CHUNK_SIZE * 2:
-                audio_buffer = audio_buffer[-(CHUNK_SIZE*2):]
+            # take required chunk - most recent data
+            audio_segment = np.array(list(audio_buffer)[-CHUNK_SIZE:], dtype=np.float32)
+            waveform_buffer.copy_(torch.from_numpy(audio_segment), non_blocking=True)
 
-            # process when enough audio is collected
-            if len(audio_buffer) >= CHUNK_SIZE:
+            # volume check on gpu - faster   # convert to tensor
+            volume_window = waveform_buffer[-SHORT_WINDOW:]
+            volume_sq = torch.mean(volume_window * volume_window)
+            volume = torch.sqrt(volume_sq).item() #######?? synchronise
 
-                # take required chunk - most recent data
-                audio_segment = audio_buffer[-CHUNK_SIZE:]
+            if volume < VOLUME_THRESHOLD:
+                print(f"Silence: {volume:.3f}")
+                
+                for _ in range(HOP_SIZE):
+                    if audio_buffer:
+                        audio_buffer.popleft()
+                continue
 
-                # volume check on gpu - faster   # convert to tensor
-                waveform = torch.from_numpy(audio_segment).to(device, non_blocking=True)
-                volume = torch.sqrt(torch.mean(waveform[-SHORT_WINDOW:]**2)).item()
+            waveform_batch = waveform_buffer.unsqueeze(0)
 
-                if volume < VOLUME_THRESHOLD:
-                    print(f"Silence: {volume:.3f}")
-                    audio_buffer = audio_buffer[HOP_SIZE:]
-                    continue    # get next chunk
+            # create spectrogram
+            mel_spec = mel_transform(waveform_batch)
+            mel_db = amplitude_to_db(mel_spec)
 
-                start_time = time.perf_counter()
-                audio_buffer = audio_buffer[HOP_SIZE:]    # shift buffer for next pred
-    
-                waveform = waveform.unsqueeze(0)    # add batch dim    
+            x = mel_db.unsqueeze(1)  # add channel dimension since model expects
 
-                # create spectrogram
-                mel_spec = mel_transform(waveform)
-                mel_db = amplitude_to_db(mel_spec)
+            # forward
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)
 
-                x = mel_db.unsqueeze(1)  # add channel dimension since model expects
+            pred_idx = probs.argmax(dim=1).item()
+            pred_class = class_names[pred_idx]
+            confidence = 100*probs[0, pred_idx].item()
 
-                # forward
-                logits = model(x)
-                probs = torch.softmax(logits, dim=1)
+            inf_time = (time.perf_counter() - start_time) * 1000 # time in ms
 
-                pred_idx = probs.argmax(dim=1).item()
-                pred_class = class_names[pred_idx]
-                confidence = 100*probs[0, pred_idx].item()
+            print(f"[{inf_time:.2f}ms]  {pred_class}: {confidence:.2f}%")
 
-                inf_time = (time.perf_counter() - start_time) * 1000 # time in ms
-
-                print(f"[{inf_time:.2f}ms]  {pred_class}: {confidence:.2f}%")
-
-
+            for _ in range(HOP_SIZE):
+                if audio_buffer:
+                    audio_buffer.popleft()
 
 
 
