@@ -29,7 +29,7 @@ VOLUME_THRESHOLD = 0.03    # uses RMS
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # model path
-model_dir = "pytorch training/models"
+model_dir = "pytorch_training/models"
 model_path = os.path.join(model_dir, "best_model_augmented_ONECYCLE_adam_drop2d2.pth")
 print(model_path, "\n")
 
